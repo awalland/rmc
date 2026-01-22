@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
     time::{Duration, Instant},
@@ -8,6 +8,9 @@ use std::{
 
 use ratatui::widgets::ListState;
 use walkdir::WalkDir;
+
+/// Threshold after which we show "Loading..." indicator
+const LOADING_INDICATOR_THRESHOLD: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum SizeDisplayMode {
@@ -51,9 +54,9 @@ pub struct LoadResult {
     pub entries: Result<Vec<Entry>, String>,
 }
 
-/// Result from async size calculation
+/// Result from async size calculation - uses path for safety across refreshes
 pub struct SizeResult {
-    pub index: usize,
+    pub path: PathBuf,
     pub size: u64,
 }
 
@@ -74,9 +77,6 @@ pub struct PaneState {
     /// When size calculation started
     pub size_calc_since: Option<Instant>,
 }
-
-/// Threshold after which we show "Loading..." indicator
-const LOADING_INDICATOR_THRESHOLD: Duration = Duration::from_millis(100);
 
 impl PaneState {
     pub fn new(path: PathBuf) -> std::io::Result<Self> {
@@ -107,52 +107,7 @@ impl PaneState {
         self.size_rx = None;
         self.size_calc_since = None;
 
-        if let Some(parent) = self.path.parent() {
-            self.entries.push(Entry {
-                name: "..".to_owned(),
-                path: parent.to_path_buf(),
-                is_dir: true,
-                size: None,
-            });
-        }
-
-        let size_mode = self.size_mode;
-        let mut entries: Vec<Entry> = std::fs::read_dir(&self.path)?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                if self.show_hidden {
-                    true
-                } else {
-                    !e.file_name().to_string_lossy().starts_with('.')
-                }
-            })
-            .map(|e| {
-                let metadata = e.metadata().ok();
-                let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                // In Quick mode: show entry size for all (files + directory inodes)
-                // In Full mode: show file sizes now, directory sizes calculated async
-                let size = match size_mode {
-                    SizeDisplayMode::None => None,
-                    SizeDisplayMode::Quick => metadata.map(|m| m.len()),
-                    SizeDisplayMode::Full if !is_dir => metadata.map(|m| m.len()),
-                    SizeDisplayMode::Full => None, // Directory sizes calculated separately
-                };
-                Entry {
-                    name: e.file_name().to_string_lossy().into_owned(),
-                    path: e.path(),
-                    is_dir,
-                    size,
-                }
-            })
-            .collect();
-
-        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        });
-
-        self.entries.extend(entries);
+        self.entries = load_directory_entries(&self.path, self.show_hidden, self.size_mode)?;
 
         // If in full mode, start async size calculation for directories
         if self.size_mode == SizeDisplayMode::Full {
@@ -177,8 +132,9 @@ impl PaneState {
         self.loading_since = Some(Instant::now());
 
         thread::spawn(move || {
-            let result = load_directory(&path, show_hidden, size_mode);
-            let _ = tx.send(LoadResult { path, entries: result });
+            let entries = load_directory_entries(&path, show_hidden, size_mode)
+                .map_err(|e| format_io_error(&e));
+            let _ = tx.send(LoadResult { path, entries });
         });
     }
 
@@ -244,12 +200,11 @@ impl PaneState {
     /// Start async size calculation for directories
     pub fn start_size_calculation(&mut self) {
         // Collect directories that need size calculation
-        let dirs_to_calc: Vec<(usize, PathBuf)> = self
+        let dirs_to_calc: Vec<PathBuf> = self
             .entries
             .iter()
-            .enumerate()
-            .filter(|(_, e)| e.is_dir && e.name != "..")
-            .map(|(i, e)| (i, e.path.clone()))
+            .filter(|e| e.is_dir && e.name != "..")
+            .map(|e| e.path.clone())
             .collect();
 
         if dirs_to_calc.is_empty() {
@@ -261,9 +216,9 @@ impl PaneState {
         self.size_calc_since = Some(Instant::now());
 
         thread::spawn(move || {
-            for (index, path) in dirs_to_calc {
+            for path in dirs_to_calc {
                 let size = calculate_dir_size(&path);
-                if tx.send(SizeResult { index, size }).is_err() {
+                if tx.send(SizeResult { path, size }).is_err() {
                     break; // Receiver dropped, stop calculating
                 }
             }
@@ -281,7 +236,8 @@ impl PaneState {
         loop {
             match rx.try_recv() {
                 Ok(result) => {
-                    if let Some(entry) = self.entries.get_mut(result.index) {
+                    // Find entry by path instead of index (safe across refreshes)
+                    if let Some(entry) = self.entries.iter_mut().find(|e| e.path == result.path) {
                         entry.size = Some(result.size);
                     }
                 }
@@ -397,12 +353,7 @@ impl PaneState {
                     self.list_state.select(old_selection);
                     self.selected = old_selected;
 
-                    let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        "Permission denied".to_owned()
-                    } else {
-                        format!("Cannot open directory: {}", e)
-                    };
-                    return Err(msg);
+                    return Err(format_io_error(&e));
                 }
 
                 self.list_state.select(Some(0));
@@ -412,8 +363,25 @@ impl PaneState {
     }
 }
 
-/// Load directory entries in a background thread
-fn load_directory(path: &PathBuf, show_hidden: bool, size_mode: SizeDisplayMode) -> Result<Vec<Entry>, String> {
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Format an IO error into a user-friendly message
+fn format_io_error(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        "Permission denied".to_owned()
+    } else {
+        format!("Cannot open directory: {}", e)
+    }
+}
+
+/// Load directory entries (shared implementation for sync and async loading)
+fn load_directory_entries(
+    path: &Path,
+    show_hidden: bool,
+    size_mode: SizeDisplayMode,
+) -> std::io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
 
     // Add parent directory entry
@@ -427,59 +395,48 @@ fn load_directory(path: &PathBuf, show_hidden: bool, size_mode: SizeDisplayMode)
     }
 
     // Read directory entries
-    let dir_entries: Vec<Entry> = match std::fs::read_dir(path) {
-        Ok(read_dir) => read_dir
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                if show_hidden {
-                    true
-                } else {
-                    !e.file_name().to_string_lossy().starts_with('.')
-                }
-            })
-            .map(|e| {
-                let metadata = e.metadata().ok();
-                let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                // In Quick mode: show entry size for all (files + directory inodes)
-                // In Full mode: show file sizes now, directory sizes calculated async
-                let size = match size_mode {
-                    SizeDisplayMode::None => None,
-                    SizeDisplayMode::Quick => metadata.map(|m| m.len()),
-                    SizeDisplayMode::Full if !is_dir => metadata.map(|m| m.len()),
-                    SizeDisplayMode::Full => None, // Directory sizes calculated separately
-                };
-                Entry {
-                    name: e.file_name().to_string_lossy().into_owned(),
-                    path: e.path(),
-                    is_dir,
-                    size,
-                }
-            })
-            .collect(),
-        Err(e) => {
-            let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
-                "Permission denied".to_owned()
+    let mut dir_entries: Vec<Entry> = std::fs::read_dir(path)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            if show_hidden {
+                true
             } else {
-                format!("Cannot open directory: {}", e)
+                !e.file_name().to_string_lossy().starts_with('.')
+            }
+        })
+        .map(|e| {
+            let metadata = e.metadata().ok();
+            let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            // In Quick mode: show entry size for all (files + directory inodes)
+            // In Full mode: show file sizes now, directory sizes calculated async
+            let size = match size_mode {
+                SizeDisplayMode::None => None,
+                SizeDisplayMode::Quick => metadata.map(|m| m.len()),
+                SizeDisplayMode::Full if !is_dir => metadata.map(|m| m.len()),
+                SizeDisplayMode::Full => None, // Directory sizes calculated separately
             };
-            return Err(msg);
-        }
-    };
+            Entry {
+                name: e.file_name().to_string_lossy().into_owned(),
+                path: e.path(),
+                is_dir,
+                size,
+            }
+        })
+        .collect();
 
-    // Sort: directories first, then by name
-    let mut sorted: Vec<Entry> = dir_entries;
-    sorted.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+    // Sort: directories first, then by name (case-insensitive)
+    dir_entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
         _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
 
-    entries.extend(sorted);
+    entries.extend(dir_entries);
     Ok(entries)
 }
 
 /// Calculate the total size of a directory recursively
-fn calculate_dir_size(path: &PathBuf) -> u64 {
+fn calculate_dir_size(path: &Path) -> u64 {
     WalkDir::new(path)
         .into_iter()
         .filter_map(|e| e.ok())

@@ -59,7 +59,7 @@ impl ViewMode {
             ViewMode::FileInfo => "i",
             ViewMode::Exif => "e",
             ViewMode::Archive => "a",
-            ViewMode::Json => "j",
+            ViewMode::Json => "J", // Capital J since lowercase j is for scrolling
         }
     }
 }

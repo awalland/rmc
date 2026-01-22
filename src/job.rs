@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -12,6 +12,11 @@ use std::{
 };
 
 use walkdir::WalkDir;
+
+use crate::util::{
+    COPY_BUFFER_SIZE, JOB_VISIBILITY_THRESHOLD_MS, THROUGHPUT_HISTORY_SIZE,
+    THROUGHPUT_SAMPLE_INTERVAL_MS,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct JobId(u64);
@@ -43,12 +48,10 @@ pub struct JobProgress {
     pub total_files: u64,
 }
 
-const THROUGHPUT_HISTORY_SIZE: usize = 60;
-const THROUGHPUT_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
-
 #[derive(Clone)]
 pub struct ThroughputTracker {
-    pub history: Vec<u64>,          // bytes/sec samples
+    /// Bytes/sec samples - using VecDeque for O(1) push/pop
+    pub history: VecDeque<u64>,
     last_sample_time: Instant,
     last_sample_bytes: u64,
 }
@@ -56,7 +59,7 @@ pub struct ThroughputTracker {
 impl ThroughputTracker {
     pub fn new() -> Self {
         Self {
-            history: Vec::with_capacity(THROUGHPUT_HISTORY_SIZE),
+            history: VecDeque::with_capacity(THROUGHPUT_HISTORY_SIZE),
             last_sample_time: Instant::now(),
             last_sample_bytes: 0,
         }
@@ -65,8 +68,9 @@ impl ThroughputTracker {
     pub fn update(&mut self, current_bytes: u64) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_sample_time);
+        let sample_interval = Duration::from_millis(THROUGHPUT_SAMPLE_INTERVAL_MS);
 
-        if elapsed >= THROUGHPUT_SAMPLE_INTERVAL {
+        if elapsed >= sample_interval {
             let bytes_diff = current_bytes.saturating_sub(self.last_sample_bytes);
             let secs = elapsed.as_secs_f64();
             let throughput = if secs > 0.0 {
@@ -75,9 +79,9 @@ impl ThroughputTracker {
                 0
             };
 
-            self.history.push(throughput);
+            self.history.push_back(throughput);
             if self.history.len() > THROUGHPUT_HISTORY_SIZE {
-                self.history.remove(0);
+                self.history.pop_front(); // O(1) with VecDeque
             }
 
             self.last_sample_time = now;
@@ -86,7 +90,12 @@ impl ThroughputTracker {
     }
 
     pub fn current_throughput(&self) -> u64 {
-        self.history.last().copied().unwrap_or(0)
+        self.history.back().copied().unwrap_or(0)
+    }
+
+    /// Get history as a slice for rendering (VecDeque may not be contiguous)
+    pub fn history_slice(&self) -> Vec<u64> {
+        self.history.iter().copied().collect()
     }
 }
 
@@ -148,10 +157,12 @@ struct WorkerHandle {
 
 pub struct JobManager {
     jobs: HashMap<JobId, Job>,
-    pub progress_rx: Receiver<JobUpdate>,
+    progress_rx: Receiver<JobUpdate>,
     progress_tx: Sender<JobUpdate>,
     workers: HashMap<JobId, WorkerHandle>,
     next_id: u64,
+    /// Pending conflicts that need UI resolution
+    pending_conflicts: VecDeque<(JobId, PathBuf)>,
 }
 
 impl JobManager {
@@ -163,6 +174,7 @@ impl JobManager {
             progress_tx,
             workers: HashMap::new(),
             next_id: 0,
+            pending_conflicts: VecDeque::new(),
         }
     }
 
@@ -219,7 +231,16 @@ impl JobManager {
         let progress_tx = self.progress_tx.clone();
 
         thread::spawn(move || {
-            transfer_worker(id, job_type, source, dest_dir, progress_tx, cancel_flag, pause_flag, conflict_rx);
+            transfer_worker(
+                id,
+                job_type,
+                source,
+                dest_dir,
+                progress_tx,
+                cancel_flag,
+                pause_flag,
+                conflict_rx,
+            );
         });
 
         id
@@ -307,7 +328,12 @@ impl JobManager {
     }
 
     /// Start a rename job that runs in the background
-    pub fn start_rename_job(&mut self, original: PathBuf, new_path: PathBuf, parent_dir: PathBuf) -> JobId {
+    pub fn start_rename_job(
+        &mut self,
+        original: PathBuf,
+        new_path: PathBuf,
+        parent_dir: PathBuf,
+    ) -> JobId {
         let id = JobId(self.next_id);
         self.next_id += 1;
 
@@ -363,6 +389,7 @@ impl JobManager {
         let mut completed_destinations = Vec::new();
         let mut completed_sources = Vec::new();
 
+        // Process ALL pending updates from the channel
         while let Ok(update) = self.progress_rx.try_recv() {
             match update {
                 JobUpdate::ScanComplete {
@@ -415,8 +442,9 @@ impl JobManager {
                     }
                     self.workers.remove(&job_id);
                 }
-                JobUpdate::ConflictDetected { .. } => {
-                    // Handled separately via UI
+                JobUpdate::ConflictDetected { job_id, file_path } => {
+                    // Queue conflicts for UI handling instead of dropping them
+                    self.pending_conflicts.push_back((job_id, file_path));
                 }
             }
         }
@@ -424,8 +452,18 @@ impl JobManager {
         (completed_destinations, completed_sources)
     }
 
+    /// Get the next pending conflict that needs UI resolution
+    pub fn next_pending_conflict(&mut self) -> Option<(JobId, PathBuf)> {
+        self.pending_conflicts.pop_front()
+    }
+
+    /// Check if there are pending conflicts
+    pub fn has_pending_conflicts(&self) -> bool {
+        !self.pending_conflicts.is_empty()
+    }
+
     pub fn update_visibility(&mut self) {
-        let threshold = Duration::from_millis(500);
+        let threshold = Duration::from_millis(JOB_VISIBILITY_THRESHOLD_MS);
         let now = Instant::now();
 
         for job in self.jobs.values_mut() {
@@ -440,7 +478,12 @@ impl JobManager {
     pub fn active_job_count(&self) -> usize {
         self.jobs
             .values()
-            .filter(|j| matches!(j.status, JobStatus::Running { .. } | JobStatus::Visible | JobStatus::Paused))
+            .filter(|j| {
+                matches!(
+                    j.status,
+                    JobStatus::Running { .. } | JobStatus::Visible | JobStatus::Paused
+                )
+            })
             .count()
     }
 
@@ -473,7 +516,12 @@ impl JobManager {
         let active_jobs: Vec<_> = self
             .jobs
             .values()
-            .filter(|j| matches!(j.status, JobStatus::Running { .. } | JobStatus::Visible | JobStatus::Paused))
+            .filter(|j| {
+                matches!(
+                    j.status,
+                    JobStatus::Running { .. } | JobStatus::Visible | JobStatus::Paused
+                )
+            })
             .filter(|j| j.job_type != JobType::Delete) // Only check copy/move jobs
             .collect();
 
@@ -498,6 +546,7 @@ impl JobManager {
 // Transfer Worker (Copy/Move)
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn transfer_worker(
     job_id: JobId,
     job_type: JobType,
@@ -601,6 +650,7 @@ fn transfer_worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_dir_with_progress(
     source: &Path,
     dest: &Path,
@@ -653,6 +703,7 @@ fn copy_dir_with_progress(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_file_with_progress(
     source: &Path,
     dest: &Path,
@@ -708,9 +759,9 @@ fn copy_file_with_progress(
     let src_file = std::fs::File::open(source)?;
     let dest_file = std::fs::File::create(dest)?;
 
-    let mut reader = BufReader::with_capacity(64 * 1024, src_file);
-    let mut writer = BufWriter::with_capacity(64 * 1024, dest_file);
-    let mut buffer = [0u8; 64 * 1024];
+    let mut reader = BufReader::with_capacity(COPY_BUFFER_SIZE, src_file);
+    let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, dest_file);
+    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
 
     let file_name = source
         .file_name()
