@@ -3,6 +3,7 @@ mod job;
 mod pane;
 mod state;
 mod theme;
+mod viewer;
 
 use std::{
     env,
@@ -19,15 +20,16 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Sparkline},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Sparkline, Wrap},
     DefaultTerminal, Frame,
 };
 
 use dialog::{centered_rect, handle_yes_no_keys, render_dialog_frame, render_yes_no_buttons, DialogResult};
 use job::{ConflictResolution, Job, JobId, JobManager, JobStatus, JobType, JobUpdate};
-use pane::{Entry, Pane, PaneState};
+use pane::{Entry, Pane, PaneState, SizeDisplayMode};
 use state::AppState;
 use theme::THEME;
+use viewer::{FileViewer, ViewMode};
 
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
@@ -45,12 +47,24 @@ enum UIMode {
     Normal,
     JobList { selected: usize },
     ConfirmOverwrite { job_id: JobId, file_path: PathBuf },
-    ConfirmDelete { entries: Vec<Entry> },
+    ConfirmDelete {
+        entries: Vec<Entry>,
+        /// Cached result of conflict check (computed once when dialog opens)
+        has_job_conflict: bool,
+    },
     MkdirInput { input: String },
     RenameInput { original: PathBuf, input: String },
+    /// Rename is in progress - show countdown if it takes too long
+    RenameInProgress {
+        job_id: JobId,
+        started_at: Instant,
+        original_name: String,
+        new_name: String,
+    },
     CommandLine { input: String },
     ConfirmQuit,
     Search { query: String },
+    FileViewer { viewer: Box<FileViewer> },
 }
 
 impl Default for UIMode {
@@ -113,30 +127,78 @@ impl App {
             // Process job updates
             let (completed_dests, completed_sources) = self.job_manager.process_updates();
 
-            // Refresh panes for completed destinations
+            // Refresh panes asynchronously for completed destinations
             for dest in completed_dests {
-                if self.left.path == dest {
-                    let _ = self.left.load_entries();
+                if self.left.path == dest && !self.left.is_loading_any() {
+                    self.left.load_entries_async();
                 }
-                if self.right.path == dest {
-                    let _ = self.right.load_entries();
+                if self.right.path == dest && !self.right.is_loading_any() {
+                    self.right.load_entries_async();
                 }
             }
 
-            // Refresh panes for completed move sources
+            // Refresh panes asynchronously for completed move/delete sources
             for source in completed_sources {
-                if self.left.path == source {
-                    let _ = self.left.load_entries();
+                if self.left.path == source && !self.left.is_loading_any() {
+                    self.left.load_entries_async();
                 }
-                if self.right.path == source {
-                    let _ = self.right.load_entries();
+                if self.right.path == source && !self.right.is_loading_any() {
+                    self.right.load_entries_async();
                 }
             }
+
+            // Poll for async directory loading results
+            if let Some(Err(e)) = self.left.poll_load_result() {
+                self.error_message = Some((e, Instant::now()));
+            }
+            if let Some(Err(e)) = self.right.poll_load_result() {
+                self.error_message = Some((e, Instant::now()));
+            }
+
+            // Poll for size calculation results
+            self.left.poll_size_results();
+            self.right.poll_size_results();
 
             self.job_manager.update_visibility();
 
             // Check for pending conflicts
             self.check_for_conflicts();
+
+            // Handle RenameInProgress: auto-close dialog when done or after timeout
+            if let UIMode::RenameInProgress { job_id, started_at, .. } = &self.ui_mode {
+                let job_id = *job_id;
+                let elapsed = started_at.elapsed();
+
+                // Check if job completed (or failed/cancelled)
+                let job_status = self.job_manager.get_job(job_id).map(|j| j.status.clone());
+
+                match job_status {
+                    Some(JobStatus::Completed) => {
+                        self.job_manager.dismiss_job(job_id);
+                        self.ui_mode = UIMode::Normal;
+                    }
+                    Some(JobStatus::Failed(e)) => {
+                        self.error_message = Some((format!("Rename failed: {}", e), Instant::now()));
+                        self.job_manager.dismiss_job(job_id);
+                        self.ui_mode = UIMode::Normal;
+                    }
+                    Some(JobStatus::Cancelled) => {
+                        self.job_manager.dismiss_job(job_id);
+                        self.ui_mode = UIMode::Normal;
+                    }
+                    Some(_) => {
+                        // Job still running - close dialog after 4 seconds (1s + 3s countdown)
+                        if elapsed >= Duration::from_secs(4) {
+                            // Job takes too long, background it (leave in job list)
+                            self.ui_mode = UIMode::Normal;
+                        }
+                    }
+                    None => {
+                        // Job doesn't exist anymore, close dialog
+                        self.ui_mode = UIMode::Normal;
+                    }
+                }
+            }
 
             // Clear old error messages (after 3 seconds)
             if let Some((_, timestamp)) = &self.error_message {
@@ -185,7 +247,7 @@ impl App {
                     UIMode::ConfirmOverwrite { job_id, .. } => {
                         self.handle_confirm_overwrite(key.code, *job_id)
                     }
-                    UIMode::ConfirmDelete { entries } => {
+                    UIMode::ConfirmDelete { entries, .. } => {
                         self.handle_confirm_delete(key.code, entries.clone())
                     }
                     UIMode::MkdirInput { input } => {
@@ -193,6 +255,9 @@ impl App {
                     }
                     UIMode::RenameInput { original, input } => {
                         self.handle_rename_input(key.code, original.clone(), input.clone())
+                    }
+                    UIMode::RenameInProgress { job_id, .. } => {
+                        self.handle_rename_in_progress(key.code, *job_id)
                     }
                     UIMode::CommandLine { input } => {
                         self.handle_command_line(key.code, input.clone(), terminal)?
@@ -202,6 +267,9 @@ impl App {
                     }
                     UIMode::Search { query } => {
                         self.handle_search(key.code, key.modifiers, query.clone());
+                    }
+                    UIMode::FileViewer { viewer } => {
+                        self.handle_file_viewer(key.code, viewer.clone());
                     }
                 }
             }
@@ -282,6 +350,9 @@ impl App {
             KeyCode::Delete | KeyCode::F(8) => {
                 self.initiate_delete();
             }
+            KeyCode::F(3) => {
+                self.view_selected();
+            }
             KeyCode::Char('e') | KeyCode::F(4) => {
                 if let Err(msg) = self.edit_selected(terminal) {
                     self.error_message = Some((msg, Instant::now()));
@@ -289,6 +360,9 @@ impl App {
             }
             KeyCode::Char('H') => {
                 self.active_pane_mut().toggle_hidden();
+            }
+            KeyCode::Char('S') => {
+                self.active_pane_mut().cycle_size_mode();
             }
             KeyCode::F(7) => {
                 self.ui_mode = UIMode::MkdirInput { input: String::new() };
@@ -393,7 +467,14 @@ impl App {
             return;
         }
 
-        self.ui_mode = UIMode::ConfirmDelete { entries };
+        // Canonicalize paths once and check for conflicts (blocking I/O happens here, not during render)
+        let paths_canonical: Vec<PathBuf> = entries
+            .iter()
+            .map(|e| e.path.canonicalize().unwrap_or_else(|_| e.path.clone()))
+            .collect();
+        let has_job_conflict = self.job_manager.paths_conflict_with_active_jobs(&paths_canonical);
+
+        self.ui_mode = UIMode::ConfirmDelete { entries, has_job_conflict };
     }
 
     fn handle_confirm_delete(&mut self, key: KeyCode, entries: Vec<Entry>) {
@@ -599,23 +680,32 @@ impl App {
                     let new_path = original.parent().unwrap_or(Path::new(".")).join(&input);
 
                     if new_path != original {
-                        match std::fs::rename(&original, &new_path) {
-                            Ok(()) => {
-                                // Refresh the pane
-                                match self.active_pane {
-                                    Pane::Left => {
-                                        let _ = self.left.load_entries();
-                                    }
-                                    Pane::Right => {
-                                        let _ = self.right.load_entries();
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                self.error_message =
-                                    Some((format!("Rename failed: {}", e), Instant::now()));
-                            }
-                        }
+                        // Get parent directory for refresh
+                        let parent_dir = match self.active_pane {
+                            Pane::Left => self.left.path.clone(),
+                            Pane::Right => self.right.path.clone(),
+                        };
+
+                        // Start async rename job
+                        let job_id = self.job_manager.start_rename_job(
+                            original.clone(),
+                            new_path,
+                            parent_dir,
+                        );
+
+                        let original_name = original
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+
+                        self.ui_mode = UIMode::RenameInProgress {
+                            job_id,
+                            started_at: Instant::now(),
+                            original_name,
+                            new_name: input,
+                        };
+                        return;
                     }
                 }
                 self.ui_mode = UIMode::Normal;
@@ -632,6 +722,14 @@ impl App {
                 self.ui_mode = UIMode::RenameInput { original, input };
             }
             _ => {}
+        }
+    }
+
+    fn handle_rename_in_progress(&mut self, key: KeyCode, job_id: JobId) {
+        // Only handle Escape to cancel
+        if key == KeyCode::Esc {
+            self.job_manager.cancel_job(job_id);
+            self.ui_mode = UIMode::Normal;
         }
     }
 
@@ -981,6 +1079,67 @@ impl App {
         Ok(())
     }
 
+    fn view_selected(&mut self) {
+        let pane = match self.active_pane {
+            Pane::Left => &self.left,
+            Pane::Right => &self.right,
+        };
+
+        let Some(entry) = pane.selected_entry() else {
+            return;
+        };
+
+        // Don't view ".." or directories
+        if entry.name == ".." || entry.is_dir {
+            return;
+        }
+
+        let viewer = FileViewer::new(entry.path.clone());
+        self.ui_mode = UIMode::FileViewer {
+            viewer: Box::new(viewer),
+        };
+    }
+
+    fn handle_file_viewer(&mut self, key: KeyCode, mut viewer: Box<FileViewer>) {
+        // Calculate visible height (will be set properly during render, use estimate)
+        let visible_height = 20usize;
+
+        match key {
+            // Exit viewer
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(3) => {
+                self.ui_mode = UIMode::Normal;
+                return;
+            }
+
+            // Scrolling
+            KeyCode::Up | KeyCode::Char('k') => viewer.scroll_up(1),
+            KeyCode::Down | KeyCode::Char('j') => viewer.scroll_down(1, visible_height),
+            KeyCode::PageUp => viewer.scroll_up(visible_height),
+            KeyCode::PageDown => viewer.scroll_down(visible_height, visible_height),
+            KeyCode::Home | KeyCode::Char('g') => viewer.scroll_to_top(),
+            KeyCode::End | KeyCode::Char('G') => viewer.scroll_to_bottom(visible_height),
+
+            // View mode switches
+            KeyCode::Char('t') => viewer.set_mode(ViewMode::Text),
+            KeyCode::Char('x') => viewer.set_mode(ViewMode::Hex),
+            KeyCode::Char('d') => viewer.set_mode(ViewMode::Disasm),
+            KeyCode::Char('s') => viewer.set_mode(ViewMode::Strings),
+            KeyCode::Char('h') => viewer.set_mode(ViewMode::ElfHeader),
+            KeyCode::Char('S') => viewer.set_mode(ViewMode::Sections),
+            KeyCode::Char('y') => viewer.set_mode(ViewMode::Symbols),
+            KeyCode::Char('l') => viewer.set_mode(ViewMode::Ldd),
+            KeyCode::Char('i') => viewer.set_mode(ViewMode::FileInfo),
+            KeyCode::Char('e') => viewer.set_mode(ViewMode::Exif),
+            KeyCode::Char('a') => viewer.set_mode(ViewMode::Archive),
+            // Note: 'j' is already used for scrolling, use Ctrl+J or another key for JSON
+            KeyCode::Char('J') => viewer.set_mode(ViewMode::Json),
+
+            _ => {}
+        }
+
+        self.ui_mode = UIMode::FileViewer { viewer };
+    }
+
     fn toggle_pane(&mut self) {
         self.active_pane = match self.active_pane {
             Pane::Left => Pane::Right,
@@ -1039,6 +1198,7 @@ impl App {
             JobType::Copy => "copy",
             JobType::Move => "move",
             JobType::Delete => "delete", // Not used, delete has its own validation
+            JobType::Rename => "rename", // Not used, rename has its own validation
         };
         // Check source exists
         if !source.exists() {
@@ -1129,14 +1289,17 @@ impl App {
             UIMode::ConfirmOverwrite { file_path, .. } => {
                 self.render_conflict_dialog(frame, file_path);
             }
-            UIMode::ConfirmDelete { entries } => {
-                self.render_delete_dialog(frame, entries);
+            UIMode::ConfirmDelete { entries, has_job_conflict } => {
+                self.render_delete_dialog(frame, entries, *has_job_conflict);
             }
             UIMode::MkdirInput { input } => {
                 self.render_mkdir_dialog(frame, input);
             }
             UIMode::RenameInput { input, .. } => {
                 self.render_rename_dialog(frame, input);
+            }
+            UIMode::RenameInProgress { started_at, original_name, new_name, .. } => {
+                self.render_rename_progress(frame, *started_at, original_name, new_name);
             }
             UIMode::CommandLine { input } => {
                 self.render_command_line(frame, input);
@@ -1146,6 +1309,9 @@ impl App {
             }
             UIMode::Search { query } => {
                 self.render_search_bar(frame, query);
+            }
+            UIMode::FileViewer { viewer } => {
+                self.render_file_viewer(frame, viewer);
             }
             UIMode::Normal => {}
         }
@@ -1164,11 +1330,23 @@ impl App {
             Style::default().fg(THEME.pane_inactive_border)
         };
 
+        // Build title with loading/calculating indicators
+        let mut title = format!(" {} ", pane_state.path.display());
+        if pane_state.is_loading() {
+            title.push_str("[Loading...] ");
+        } else if pane_state.is_calculating_sizes() {
+            title.push_str("[Calculating...] ");
+        }
+
         let block = Block::default()
-            .title(format!(" {} ", pane_state.path.display()))
+            .title(title)
             .title_style(Style::default().fg(THEME.pane_title))
             .borders(Borders::ALL)
             .border_style(border_style);
+
+        // Calculate available width for size column
+        let inner_width = area.width.saturating_sub(2) as usize; // -2 for borders
+        let size_mode = pane_state.size_mode;
 
         let items: Vec<ListItem> = pane_state
             .entries
@@ -1189,11 +1367,33 @@ impl App {
                     base_style
                 };
                 let marker = if is_multi_selected { "* " } else { "  " };
-                let display = if entry.is_dir {
+                let name_with_marker = if entry.is_dir {
                     format!("{}{}/", marker, entry.name)
                 } else {
                     format!("{}{}", marker, entry.name)
                 };
+
+                // Format size if available and mode is not None
+                let display = if size_mode != SizeDisplayMode::None {
+                    let size_str = match entry.size {
+                        Some(size) => format_size(size),
+                        // Only show "..." for directories in Full mode while calculating
+                        None if entry.is_dir && size_mode == SizeDisplayMode::Full => "...".to_owned(),
+                        None => String::new(),
+                    };
+                    // Right-align size with 8 char width
+                    let size_width = 8;
+                    let name_width = inner_width.saturating_sub(size_width + 4); // 4 for highlight symbol
+                    let truncated_name = if name_with_marker.len() > name_width {
+                        format!("{}…", &name_with_marker[..name_width.saturating_sub(1)])
+                    } else {
+                        name_with_marker
+                    };
+                    format!("{:<width$}{:>8}", truncated_name, size_str, width = name_width)
+                } else {
+                    name_with_marker
+                };
+
                 ListItem::new(display).style(style)
             })
             .collect();
@@ -1258,12 +1458,14 @@ impl App {
         let shortcuts = [
             ("Ins", "Select"),
             ("F2", "Rename"),
+            ("F3", "View"),
             ("F4/e", "Edit"),
             ("F5/c", "Copy"),
             ("F6/m", "Move"),
             ("F7", "Mkdir"),
             ("F8/Del", "Delete"),
             ("H", "Hidden"),
+            ("S", "Sizes"),
             ("J", "Jobs"),
             ("q", "Quit"),
         ];
@@ -1599,17 +1801,13 @@ impl App {
         frame.render_widget(cancel, btn_layout2[3]);
     }
 
-    fn render_delete_dialog(&self, frame: &mut Frame, entries: &[Entry]) {
+    fn render_delete_dialog(&self, frame: &mut Frame, entries: &[Entry], has_job_conflict: bool) {
         let area = centered_rect(50, 45, frame.area());
         let inner = render_dialog_frame(frame, area, "Confirm Delete", THEME.dialog_delete_border);
 
         // Build the message
         let has_dirs = entries.iter().any(|e| e.is_dir);
         let count = entries.len();
-
-        // Check for conflicts with active jobs
-        let paths: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
-        let has_job_conflict = self.job_manager.paths_conflict_with_active_jobs(&paths);
 
         // Calculate content layout
         let content_layout = Layout::vertical([
@@ -1721,6 +1919,47 @@ impl App {
         frame.render_widget(hint, layout[4]);
     }
 
+    fn render_rename_progress(&self, frame: &mut Frame, started_at: Instant, original_name: &str, new_name: &str) {
+        let area = centered_rect(50, 20, frame.area());
+        let inner = render_dialog_frame(frame, area, "Renaming", THEME.dialog_border);
+
+        let elapsed = started_at.elapsed();
+
+        let layout = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+        // Show what's being renamed
+        let msg = format!("'{}' → '{}'", original_name, new_name);
+        let label = Paragraph::new(msg)
+            .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(label, layout[1]);
+
+        // Show progress message
+        let progress_msg = if elapsed < Duration::from_secs(1) {
+            "Renaming...".to_owned()
+        } else {
+            // Show countdown: 4 - elapsed_secs = remaining
+            let remaining = 4u64.saturating_sub(elapsed.as_secs());
+            format!("Backgrounding in {}...", remaining)
+        };
+
+        let progress = Paragraph::new(progress_msg)
+            .style(Style::default().fg(THEME.dialog_warning_text))
+            .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(progress, layout[2]);
+
+        let hint = Paragraph::new("Esc to cancel")
+            .style(Style::default().fg(THEME.dialog_hint))
+            .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(hint, layout[4]);
+    }
+
     fn render_command_line(&self, frame: &mut Frame, input: &str) {
         // Render at the very bottom of the screen
         let area = Rect {
@@ -1793,6 +2032,101 @@ impl App {
         // Buttons
         render_yes_no_buttons(frame, layout[4]);
     }
+
+    fn render_file_viewer(&self, frame: &mut Frame, viewer: &FileViewer) {
+        // Full-screen viewer
+        let area = frame.area();
+        frame.render_widget(Clear, area);
+
+        // Layout: title bar + content + status/help bar
+        let layout = Layout::vertical([
+            Constraint::Length(1), // Title bar
+            Constraint::Min(0),    // Content
+            Constraint::Length(1), // Mode selector
+            Constraint::Length(1), // Help bar
+        ])
+        .split(area);
+
+        // Title bar
+        let file_name = viewer.path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let size_info = if viewer.truncated {
+            format!(
+                "{} of {} TRUNCATED",
+                format_bytes(viewer.file_size() as u64),
+                format_bytes(viewer.original_size)
+            )
+        } else {
+            format_bytes(viewer.original_size)
+        };
+        let title = format!(
+            " {} - {} ({}) ",
+            file_name,
+            viewer.mode.label(),
+            size_info
+        );
+        let title_style = if viewer.truncated {
+            Style::default().fg(THEME.cursor_active_fg).bg(THEME.dialog_warning_border)
+        } else {
+            Style::default().fg(THEME.cursor_active_fg).bg(THEME.cursor_active_bg)
+        };
+        let title_bar = Paragraph::new(title).style(title_style);
+        frame.render_widget(title_bar, layout[0]);
+
+        // Content area
+        let content_area = layout[1];
+        let visible_height = content_area.height as usize;
+
+        if let Some(error) = &viewer.error {
+            // Show error
+            let error_para = Paragraph::new(format!("Error: {}", error))
+                .style(Style::default().fg(THEME.status_error_fg))
+                .block(Block::default().borders(Borders::ALL));
+            frame.render_widget(error_para, content_area);
+        } else {
+            // Show content
+            let lines = viewer.visible_lines(visible_height);
+            let content: Vec<Line> = lines.iter().map(|s| Line::raw(s.as_str())).collect();
+            let mut para = Paragraph::new(content)
+                .style(Style::default().fg(THEME.file_fg).bg(THEME.dialog_bg));
+
+            // Wrap text for modes where it makes sense (not hex view)
+            if viewer.mode != ViewMode::Hex {
+                para = para.wrap(Wrap { trim: false });
+            }
+            frame.render_widget(para, content_area);
+        }
+
+        // Mode selector - show available modes
+        let available = viewer.available_modes();
+        let mut mode_spans: Vec<Span> = Vec::new();
+        for (i, mode) in available.iter().enumerate() {
+            if i > 0 {
+                mode_spans.push(Span::raw(" "));
+            }
+            let style = if *mode == viewer.mode {
+                Style::default().fg(THEME.cursor_active_fg).bg(THEME.cursor_active_bg)
+            } else {
+                Style::default().fg(THEME.help_key_fg).bg(THEME.help_key_bg)
+            };
+            mode_spans.push(Span::styled(format!(" {}:{} ", mode.shortcut(), mode.label()), style));
+        }
+        let mode_line = Line::from(mode_spans);
+        let mode_bar = Paragraph::new(mode_line)
+            .style(Style::default().bg(THEME.help_desc_bg));
+        frame.render_widget(mode_bar, layout[2]);
+
+        // Help bar with position info
+        let position = viewer.position_info(visible_height);
+        let help_text = format!(
+            " j/k:scroll  PgUp/Dn:page  g/G:top/bottom  q/Esc:close  │  {} ",
+            position
+        );
+        let help_bar = Paragraph::new(help_text)
+            .style(Style::default().fg(THEME.help_desc_fg).bg(THEME.help_desc_bg));
+        frame.render_widget(help_bar, layout[3]);
+    }
 }
 
 // ============================================================================
@@ -1812,5 +2146,25 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1}KB", bytes as f64 / KB as f64)
     } else {
         format!("{}B", bytes)
+    }
+}
+
+/// Format size for file list display (compact, max 7 chars)
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    const TB: u64 = GB * 1024;
+
+    if bytes >= TB {
+        format!("{:.1}T", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
+        format!("{:.1}G", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1}M", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1}K", bytes as f64 / KB as f64)
+    } else {
+        format!("{}", bytes)
     }
 }

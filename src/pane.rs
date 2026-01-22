@@ -1,15 +1,41 @@
 use std::{
     collections::HashSet,
     path::PathBuf,
+    sync::mpsc::{self, Receiver},
+    thread,
+    time::{Duration, Instant},
 };
 
 use ratatui::widgets::ListState;
+use walkdir::WalkDir;
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum SizeDisplayMode {
+    #[default]
+    None,
+    /// Quick mode: show file sizes only (like ls)
+    Quick,
+    /// Full mode: calculate directory sizes recursively (like du)
+    Full,
+}
+
+impl SizeDisplayMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::None => Self::Quick,
+            Self::Quick => Self::Full,
+            Self::Full => Self::None,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Entry {
     pub name: String,
     pub path: PathBuf,
     pub is_dir: bool,
+    /// File size in bytes (Some for files, None for directories in quick mode)
+    pub size: Option<u64>,
 }
 
 #[derive(Default, PartialEq, Clone, Copy)]
@@ -19,13 +45,38 @@ pub enum Pane {
     Right,
 }
 
+/// Result from async directory loading
+pub struct LoadResult {
+    pub path: PathBuf,
+    pub entries: Result<Vec<Entry>, String>,
+}
+
+/// Result from async size calculation
+pub struct SizeResult {
+    pub index: usize,
+    pub size: u64,
+}
+
 pub struct PaneState {
     pub path: PathBuf,
     pub entries: Vec<Entry>,
     pub list_state: ListState,
     pub selected: HashSet<usize>,
     pub show_hidden: bool,
+    /// Receiver for async directory loading results
+    load_rx: Option<Receiver<LoadResult>>,
+    /// When async loading started (for "Loading..." display)
+    pub loading_since: Option<Instant>,
+    /// Current size display mode
+    pub size_mode: SizeDisplayMode,
+    /// Receiver for async size calculation results
+    size_rx: Option<Receiver<SizeResult>>,
+    /// When size calculation started
+    pub size_calc_since: Option<Instant>,
 }
+
+/// Threshold after which we show "Loading..." indicator
+const LOADING_INDICATOR_THRESHOLD: Duration = Duration::from_millis(100);
 
 impl PaneState {
     pub fn new(path: PathBuf) -> std::io::Result<Self> {
@@ -35,6 +86,11 @@ impl PaneState {
             list_state: ListState::default(),
             selected: HashSet::new(),
             show_hidden: false,
+            load_rx: None,
+            loading_since: None,
+            size_mode: SizeDisplayMode::None,
+            size_rx: None,
+            size_calc_since: None,
         };
         state.load_entries()?;
         if !state.entries.is_empty() {
@@ -43,18 +99,24 @@ impl PaneState {
         Ok(state)
     }
 
+    /// Synchronous directory loading (used for initial load)
     pub fn load_entries(&mut self) -> std::io::Result<()> {
         self.entries.clear();
         self.selected.clear();
+        // Cancel any pending size calculations
+        self.size_rx = None;
+        self.size_calc_since = None;
 
         if let Some(parent) = self.path.parent() {
             self.entries.push(Entry {
                 name: "..".to_owned(),
                 path: parent.to_path_buf(),
                 is_dir: true,
+                size: None,
             });
         }
 
+        let size_mode = self.size_mode;
         let mut entries: Vec<Entry> = std::fs::read_dir(&self.path)?
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -65,11 +127,21 @@ impl PaneState {
                 }
             })
             .map(|e| {
-                let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                let metadata = e.metadata().ok();
+                let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                // In Quick mode: show entry size for all (files + directory inodes)
+                // In Full mode: show file sizes now, directory sizes calculated async
+                let size = match size_mode {
+                    SizeDisplayMode::None => None,
+                    SizeDisplayMode::Quick => metadata.map(|m| m.len()),
+                    SizeDisplayMode::Full if !is_dir => metadata.map(|m| m.len()),
+                    SizeDisplayMode::Full => None, // Directory sizes calculated separately
+                };
                 Entry {
                     name: e.file_name().to_string_lossy().into_owned(),
                     path: e.path(),
                     is_dir,
+                    size,
                 }
             })
             .collect();
@@ -81,7 +153,157 @@ impl PaneState {
         });
 
         self.entries.extend(entries);
+
+        // If in full mode, start async size calculation for directories
+        if self.size_mode == SizeDisplayMode::Full {
+            self.start_size_calculation();
+        }
+
         Ok(())
+    }
+
+    /// Start async directory loading in a background thread
+    pub fn load_entries_async(&mut self) {
+        let path = self.path.clone();
+        let show_hidden = self.show_hidden;
+        let size_mode = self.size_mode;
+
+        // Cancel any pending size calculations
+        self.size_rx = None;
+        self.size_calc_since = None;
+
+        let (tx, rx) = mpsc::channel();
+        self.load_rx = Some(rx);
+        self.loading_since = Some(Instant::now());
+
+        thread::spawn(move || {
+            let result = load_directory(&path, show_hidden, size_mode);
+            let _ = tx.send(LoadResult { path, entries: result });
+        });
+    }
+
+    /// Check if async loading has completed, returns true if results were applied
+    pub fn poll_load_result(&mut self) -> Option<Result<(), String>> {
+        let rx = self.load_rx.as_ref()?;
+
+        match rx.try_recv() {
+            Ok(result) => {
+                self.load_rx = None;
+                self.loading_since = None;
+
+                // Only apply if path still matches (user might have navigated away)
+                if result.path == self.path {
+                    match result.entries {
+                        Ok(entries) => {
+                            self.entries = entries;
+                            self.selected.clear();
+                            if !self.entries.is_empty() && self.list_state.selected().is_none() {
+                                self.list_state.select(Some(0));
+                            }
+                            // Start size calculation for directories in full mode
+                            if self.size_mode == SizeDisplayMode::Full {
+                                self.start_size_calculation();
+                            }
+                            Some(Ok(()))
+                        }
+                        Err(e) => Some(Err(e)),
+                    }
+                } else {
+                    // Path changed, ignore result
+                    None
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.load_rx = None;
+                self.loading_since = None;
+                Some(Err("Loading thread disconnected".to_owned()))
+            }
+        }
+    }
+
+    /// Returns true if we're loading and should show the indicator
+    pub fn is_loading(&self) -> bool {
+        if let Some(since) = self.loading_since {
+            since.elapsed() >= LOADING_INDICATOR_THRESHOLD
+        } else {
+            false
+        }
+    }
+
+    /// Returns true if currently loading (regardless of threshold)
+    pub fn is_loading_any(&self) -> bool {
+        self.loading_since.is_some()
+    }
+
+    /// Returns true if size calculation is in progress
+    pub fn is_calculating_sizes(&self) -> bool {
+        self.size_rx.is_some()
+    }
+
+    /// Start async size calculation for directories
+    pub fn start_size_calculation(&mut self) {
+        // Collect directories that need size calculation
+        let dirs_to_calc: Vec<(usize, PathBuf)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.is_dir && e.name != "..")
+            .map(|(i, e)| (i, e.path.clone()))
+            .collect();
+
+        if dirs_to_calc.is_empty() {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.size_rx = Some(rx);
+        self.size_calc_since = Some(Instant::now());
+
+        thread::spawn(move || {
+            for (index, path) in dirs_to_calc {
+                let size = calculate_dir_size(&path);
+                if tx.send(SizeResult { index, size }).is_err() {
+                    break; // Receiver dropped, stop calculating
+                }
+            }
+        });
+    }
+
+    /// Poll for size calculation results and update entries
+    pub fn poll_size_results(&mut self) {
+        let rx = match &self.size_rx {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        // Process all available results
+        loop {
+            match rx.try_recv() {
+                Ok(result) => {
+                    if let Some(entry) = self.entries.get_mut(result.index) {
+                        entry.size = Some(result.size);
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // All calculations complete
+                    self.size_rx = None;
+                    self.size_calc_since = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Cycle size display mode and reload entries
+    pub fn cycle_size_mode(&mut self) {
+        self.size_mode = self.size_mode.cycle();
+        // Cancel any pending size calculations
+        self.size_rx = None;
+        self.size_calc_since = None;
+        // Reload to get sizes
+        let _ = self.load_entries();
     }
 
     pub fn toggle_hidden(&mut self) {
@@ -188,4 +410,81 @@ impl PaneState {
         }
         Ok(())
     }
+}
+
+/// Load directory entries in a background thread
+fn load_directory(path: &PathBuf, show_hidden: bool, size_mode: SizeDisplayMode) -> Result<Vec<Entry>, String> {
+    let mut entries = Vec::new();
+
+    // Add parent directory entry
+    if let Some(parent) = path.parent() {
+        entries.push(Entry {
+            name: "..".to_owned(),
+            path: parent.to_path_buf(),
+            is_dir: true,
+            size: None,
+        });
+    }
+
+    // Read directory entries
+    let dir_entries: Vec<Entry> = match std::fs::read_dir(path) {
+        Ok(read_dir) => read_dir
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                if show_hidden {
+                    true
+                } else {
+                    !e.file_name().to_string_lossy().starts_with('.')
+                }
+            })
+            .map(|e| {
+                let metadata = e.metadata().ok();
+                let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                // In Quick mode: show entry size for all (files + directory inodes)
+                // In Full mode: show file sizes now, directory sizes calculated async
+                let size = match size_mode {
+                    SizeDisplayMode::None => None,
+                    SizeDisplayMode::Quick => metadata.map(|m| m.len()),
+                    SizeDisplayMode::Full if !is_dir => metadata.map(|m| m.len()),
+                    SizeDisplayMode::Full => None, // Directory sizes calculated separately
+                };
+                Entry {
+                    name: e.file_name().to_string_lossy().into_owned(),
+                    path: e.path(),
+                    is_dir,
+                    size,
+                }
+            })
+            .collect(),
+        Err(e) => {
+            let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                "Permission denied".to_owned()
+            } else {
+                format!("Cannot open directory: {}", e)
+            };
+            return Err(msg);
+        }
+    };
+
+    // Sort: directories first, then by name
+    let mut sorted: Vec<Entry> = dir_entries;
+    sorted.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
+
+    entries.extend(sorted);
+    Ok(entries)
+}
+
+/// Calculate the total size of a directory recursively
+fn calculate_dir_size(path: &PathBuf) -> u64 {
+    WalkDir::new(path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
 }

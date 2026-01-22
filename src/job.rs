@@ -21,6 +21,7 @@ pub enum JobType {
     Copy,
     Move,
     Delete,
+    Rename,
 }
 
 #[derive(Clone)]
@@ -96,6 +97,10 @@ pub struct Job {
     pub description: String,
     pub source: PathBuf,
     pub destination: PathBuf,
+    /// Cached canonicalized source path (computed once at job creation)
+    pub source_canonical: PathBuf,
+    /// Cached canonicalized destination path (computed once at job creation)
+    pub destination_canonical: PathBuf,
     pub status: JobStatus,
     pub progress: JobProgress,
     pub throughput: ThroughputTracker,
@@ -169,6 +174,7 @@ impl JobManager {
             JobType::Copy => "Copying",
             JobType::Move => "Moving",
             JobType::Delete => "Deleting", // Not used, delete has its own method
+            JobType::Rename => "Renaming", // Not used, rename has its own method
         };
 
         let description = format!(
@@ -178,12 +184,18 @@ impl JobManager {
             dest_dir.display()
         );
 
+        // Cache canonicalized paths once at job creation
+        let source_canonical = source.canonicalize().unwrap_or_else(|_| source.clone());
+        let destination_canonical = dest_dir.canonicalize().unwrap_or_else(|_| dest_dir.clone());
+
         let job = Job {
             id,
             job_type,
             description,
             source: source.clone(),
             destination: dest_dir.clone(),
+            source_canonical,
+            destination_canonical,
             status: JobStatus::Running {
                 started_at: Instant::now(),
             },
@@ -263,6 +275,8 @@ impl JobManager {
             description,
             source: parent_dir.clone(),
             destination: PathBuf::new(), // Not used for delete
+            source_canonical: PathBuf::new(), // Not used for delete
+            destination_canonical: PathBuf::new(), // Not used for delete
             status: JobStatus::Running {
                 started_at: Instant::now(),
             },
@@ -287,6 +301,52 @@ impl JobManager {
 
         thread::spawn(move || {
             delete_worker(id, paths, progress_tx, cancel_flag, pause_flag);
+        });
+
+        id
+    }
+
+    /// Start a rename job that runs in the background
+    pub fn start_rename_job(&mut self, original: PathBuf, new_path: PathBuf, parent_dir: PathBuf) -> JobId {
+        let id = JobId(self.next_id);
+        self.next_id += 1;
+
+        let original_name = original.file_name().unwrap_or_default().to_string_lossy();
+        let new_name = new_path.file_name().unwrap_or_default().to_string_lossy();
+        let description = format!("Renaming '{}' to '{}'", original_name, new_name);
+
+        let job = Job {
+            id,
+            job_type: JobType::Rename,
+            description,
+            source: parent_dir, // Parent directory for refresh
+            destination: PathBuf::new(),
+            source_canonical: PathBuf::new(),
+            destination_canonical: PathBuf::new(),
+            status: JobStatus::Running {
+                started_at: Instant::now(),
+            },
+            progress: JobProgress::default(),
+            throughput: ThroughputTracker::new(),
+        };
+
+        self.jobs.insert(id, job);
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let pause_flag = Arc::new(AtomicBool::new(false));
+        let (conflict_tx, _conflict_rx) = mpsc::channel();
+
+        let worker_handle = WorkerHandle {
+            cancel_flag: Arc::clone(&cancel_flag),
+            pause_flag: Arc::clone(&pause_flag),
+            conflict_tx,
+        };
+        self.workers.insert(id, worker_handle);
+
+        let progress_tx = self.progress_tx.clone();
+
+        thread::spawn(move || {
+            rename_worker(id, original, new_path, progress_tx, cancel_flag);
         });
 
         id
@@ -340,8 +400,8 @@ impl JobManager {
                                     completed_sources.push(parent.to_path_buf());
                                 }
                             }
-                            JobType::Delete => {
-                                // For delete, source holds the parent directory
+                            JobType::Delete | JobType::Rename => {
+                                // For delete/rename, source holds the parent directory
                                 completed_sources.push(job.source.clone());
                             }
                         }
@@ -391,6 +451,10 @@ impl JobManager {
         jobs
     }
 
+    pub fn get_job(&self, job_id: JobId) -> Option<&Job> {
+        self.jobs.get(&job_id)
+    }
+
     pub fn dismiss_job(&mut self, job_id: JobId) {
         if let Some(job) = self.jobs.get(&job_id) {
             if matches!(
@@ -402,28 +466,24 @@ impl JobManager {
         }
     }
 
-    /// Check if any of the given paths conflict with active jobs
-    /// Returns true if deleting these paths could interfere with running jobs
-    pub fn paths_conflict_with_active_jobs(&self, paths: &[PathBuf]) -> bool {
+    /// Check if any of the given paths conflict with active jobs.
+    /// Takes pre-canonicalized paths to avoid blocking I/O during render.
+    /// Returns true if deleting these paths could interfere with running jobs.
+    pub fn paths_conflict_with_active_jobs(&self, paths_canonical: &[PathBuf]) -> bool {
         let active_jobs: Vec<_> = self
             .jobs
             .values()
-            .filter(|j| matches!(j.status, JobStatus::Running { .. } | JobStatus::Visible))
+            .filter(|j| matches!(j.status, JobStatus::Running { .. } | JobStatus::Visible | JobStatus::Paused))
             .filter(|j| j.job_type != JobType::Delete) // Only check copy/move jobs
             .collect();
 
-        for path in paths {
-            let path_canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-
+        for path_canonical in paths_canonical {
             for job in &active_jobs {
-                let source_canonical = job.source.canonicalize().unwrap_or_else(|_| job.source.clone());
-                let dest_canonical = job.destination.canonicalize().unwrap_or_else(|_| job.destination.clone());
-
-                // Check if path overlaps with source or destination
-                if path_canonical.starts_with(&source_canonical)
-                    || source_canonical.starts_with(&path_canonical)
-                    || path_canonical.starts_with(&dest_canonical)
-                    || dest_canonical.starts_with(&path_canonical)
+                // Use cached canonicalized paths from job
+                if path_canonical.starts_with(&job.source_canonical)
+                    || job.source_canonical.starts_with(path_canonical)
+                    || path_canonical.starts_with(&job.destination_canonical)
+                    || job.destination_canonical.starts_with(path_canonical)
                 {
                     return true;
                 }
@@ -888,4 +948,33 @@ fn delete_path_with_progress(
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Rename Worker
+// ============================================================================
+
+fn rename_worker(
+    job_id: JobId,
+    original: PathBuf,
+    new_path: PathBuf,
+    progress_tx: Sender<JobUpdate>,
+    cancel_flag: Arc<AtomicBool>,
+) {
+    // Check cancel before starting
+    if cancel_flag.load(Ordering::Relaxed) {
+        return;
+    }
+
+    match std::fs::rename(&original, &new_path) {
+        Ok(()) => {
+            let _ = progress_tx.send(JobUpdate::Completed { job_id });
+        }
+        Err(e) => {
+            let _ = progress_tx.send(JobUpdate::Failed {
+                job_id,
+                error: e.to_string(),
+            });
+        }
+    }
 }
