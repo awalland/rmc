@@ -53,15 +53,21 @@ impl App {
         self.left_area = pane_layout[0];
         self.right_area = pane_layout[1];
 
-        self.render_pane(frame, pane_layout[0], Pane::Left);
-        self.render_pane(frame, pane_layout[1], Pane::Right);
+        // Skip pane rendering when in FileViewer mode - it covers the entire screen anyway
+        // and this avoids any potential access to pane state during render
+        if !matches!(self.ui_mode, UIMode::FileViewer { .. }) {
+            self.render_pane(frame, pane_layout[0], Pane::Left);
+            self.render_pane(frame, pane_layout[1], Pane::Right);
+        }
 
-        // Status bar and help bar
-        if has_status {
-            self.render_status_bar(frame, main_layout[1]);
-            self.render_help_bar(frame, main_layout[2]);
-        } else {
-            self.render_help_bar(frame, main_layout[1]);
+        // Status bar and help bar - skip when in FileViewer since it covers entire screen
+        if !matches!(self.ui_mode, UIMode::FileViewer { .. }) {
+            if has_status {
+                self.render_status_bar(frame, main_layout[1]);
+                self.render_help_bar(frame, main_layout[2]);
+            } else {
+                self.render_help_bar(frame, main_layout[1]);
+            }
         }
 
         // Overlays

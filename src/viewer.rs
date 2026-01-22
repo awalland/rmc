@@ -349,47 +349,86 @@ impl FileViewer {
         }
     }
 
-    /// Run an external tool and capture its output
+    /// Run an external tool and capture its output.
+    /// Uses spawn + try_wait with a timeout to avoid blocking forever
+    /// when network filesystems cause system-wide slowdowns.
     fn run_tool(&self, tool: &str, args: &[&str]) -> Result<Vec<String>, String> {
-        // Build command with the file path
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+
         let mut cmd = Command::new(tool);
         cmd.args(args);
         cmd.arg(&self.path);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.current_dir("/tmp");
+        cmd.process_group(0); // Isolate child process
 
-        match cmd.output() {
-            Ok(output) => {
-                if output.status.success() {
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    let mut lines: Vec<String> = text
-                        .lines()
-                        .take(MAX_OUTPUT_LINES)
-                        .map(|s| s.to_owned())
-                        .collect();
-
-                    // Add truncation notice if needed
-                    let total_lines = text.lines().count();
-                    if total_lines > MAX_OUTPUT_LINES {
-                        lines.push(String::new());
-                        lines.push(format!(
-                            "--- Output truncated ({} of {} lines shown) ---",
-                            MAX_OUTPUT_LINES, total_lines
-                        ));
-                    }
-                    Ok(lines)
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if stderr.is_empty() {
-                        Err(format!("{} exited with status {}", tool, output.status))
-                    } else {
-                        Err(stderr.trim().to_owned())
-                    }
-                }
-            }
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    Err(format!("'{}' not found - install it to use this feature", tool))
+                    return Err(format!("'{}' not found - install it to use this feature", tool));
                 } else {
-                    Err(format!("Failed to run {}: {}", tool, e))
+                    return Err(format!("Failed to run {}: {}", tool, e));
+                }
+            }
+        };
+
+        // Wait with timeout (5 seconds) - network filesystem operations can
+        // cause even local commands to hang due to kernel-level blocking
+        let timeout = Duration::from_secs(5);
+        let start = Instant::now();
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let mut stdout = String::new();
+                    let mut stderr = String::new();
+
+                    if let Some(mut out) = child.stdout.take() {
+                        let _ = out.read_to_string(&mut stdout);
+                    }
+                    if let Some(mut err) = child.stderr.take() {
+                        let _ = err.read_to_string(&mut stderr);
+                    }
+
+                    if status.success() {
+                        let mut lines: Vec<String> = stdout
+                            .lines()
+                            .take(MAX_OUTPUT_LINES)
+                            .map(|s| s.to_owned())
+                            .collect();
+
+                        let total_lines = stdout.lines().count();
+                        if total_lines > MAX_OUTPUT_LINES {
+                            lines.push(String::new());
+                            lines.push(format!(
+                                "--- Output truncated ({} of {} lines shown) ---",
+                                MAX_OUTPUT_LINES, total_lines
+                            ));
+                        }
+                        return Ok(lines);
+                    } else {
+                        if stderr.is_empty() {
+                            return Err(format!("{} exited with status {}", tool, status));
+                        } else {
+                            return Err(stderr.trim().to_owned());
+                        }
+                    }
+                }
+                Ok(None) => {
+                    if start.elapsed() > timeout {
+                        let _ = child.kill();
+                        return Err(format!("{} timed out after {}s", tool, timeout.as_secs()));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(format!("Error waiting for {}: {}", tool, e));
                 }
             }
         }

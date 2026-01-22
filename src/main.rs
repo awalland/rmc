@@ -123,45 +123,39 @@ impl App {
         while !self.should_quit {
             terminal.draw(|frame| self.render(frame))?;
 
-            // Process job updates
+            // When in FileViewer mode, skip ALL background operations to ensure
+            // the UI remains responsive even when network filesystems are slow.
+            if matches!(self.ui_mode, UIMode::FileViewer { .. }) {
+                if event::poll(Duration::from_millis(EVENT_POLL_MS))? {
+                    self.handle_events(terminal)?;
+                }
+                continue;
+            }
+
+            // Process job updates (always process to keep job state current)
             let (completed_dests, completed_sources) = self.job_manager.process_updates();
 
-            // Refresh panes asynchronously for completed destinations
-            for dest in completed_dests {
-                if self.left.path == dest && !self.left.is_loading_any() {
-                    self.left.load_entries_async();
-                }
-                if self.right.path == dest && !self.right.is_loading_any() {
-                    self.right.load_entries_async();
-                }
-            }
+            // Only do pane-related operations when in Normal mode.
+            // This prevents blocking on slow/NFS filesystems when in other modal views.
+            if matches!(self.ui_mode, UIMode::Normal) {
+                // Refresh panes that match completed job paths
+                self.refresh_panes_for_paths(completed_dests);
+                self.refresh_panes_for_paths(completed_sources);
 
-            // Refresh panes asynchronously for completed move/delete sources
-            for source in completed_sources {
-                if self.left.path == source && !self.left.is_loading_any() {
-                    self.left.load_entries_async();
+                // Poll for async directory loading results
+                if let Some(Err(e)) = self.left.poll_load_result() {
+                    self.error_message = Some((e, Instant::now()));
                 }
-                if self.right.path == source && !self.right.is_loading_any() {
-                    self.right.load_entries_async();
+                if let Some(Err(e)) = self.right.poll_load_result() {
+                    self.error_message = Some((e, Instant::now()));
                 }
-            }
 
-            // Poll for async directory loading results
-            if let Some(Err(e)) = self.left.poll_load_result() {
-                self.error_message = Some((e, Instant::now()));
+                // Poll for size calculation results
+                self.left.poll_size_results();
+                self.right.poll_size_results();
             }
-            if let Some(Err(e)) = self.right.poll_load_result() {
-                self.error_message = Some((e, Instant::now()));
-            }
-
-            // Poll for size calculation results
-            self.left.poll_size_results();
-            self.right.poll_size_results();
 
             self.job_manager.update_visibility();
-
-            // Check for pending conflicts from JobManager
-            self.check_for_conflicts();
 
             // Handle RenameInProgress: auto-close dialog when done or after timeout
             self.check_rename_progress();
@@ -177,6 +171,12 @@ impl App {
             if event::poll(Duration::from_millis(EVENT_POLL_MS))? {
                 self.handle_events(terminal)?;
             }
+
+            // Check for pending conflicts AFTER handling events, so users can
+            // interact with Normal mode before being interrupted by conflict dialogs.
+            // This prevents the issue where exiting FileViewer immediately throws
+            // the user into a conflict dialog without any chance to see the normal view.
+            self.check_for_conflicts();
         }
 
         // Disable mouse capture
@@ -270,6 +270,26 @@ impl App {
         std::mem::swap(&mut self.left.list_state, &mut self.right.list_state);
         std::mem::swap(&mut self.left.show_hidden, &mut self.right.show_hidden);
         std::mem::swap(&mut self.left.size_mode, &mut self.right.size_mode);
+    }
+
+    /// Refresh any pane whose path matches one of the given paths
+    fn refresh_panes_for_paths(&mut self, paths: Vec<PathBuf>) {
+        let mut left_done = false;
+        let mut right_done = false;
+
+        for path in paths {
+            if !left_done && self.left.path == path && !self.left.is_loading_any() {
+                self.left.load_entries_async();
+                left_done = true;
+            }
+            if !right_done && self.right.path == path && !self.right.is_loading_any() {
+                self.right.load_entries_async();
+                right_done = true;
+            }
+            if left_done && right_done {
+                break;
+            }
+        }
     }
 
     // ========================================================================
