@@ -268,6 +268,8 @@ impl App {
         std::mem::swap(&mut self.left.entries, &mut self.right.entries);
         std::mem::swap(&mut self.left.selected, &mut self.right.selected);
         std::mem::swap(&mut self.left.list_state, &mut self.right.list_state);
+        std::mem::swap(&mut self.left.show_hidden, &mut self.right.show_hidden);
+        std::mem::swap(&mut self.left.size_mode, &mut self.right.size_mode);
     }
 
     // ========================================================================

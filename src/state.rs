@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const APP_NAME: &str = "rc";
+const APP_NAME: &str = "rmc";
 
 /// Get the state file path following XDG Base Directory specification
 pub fn get_state_file_path() -> PathBuf {
