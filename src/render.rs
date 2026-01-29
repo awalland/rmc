@@ -271,6 +271,7 @@ impl App {
 
         let shortcuts = [
             ("Ins", "Select"),
+            ("*", "All"),
             ("F2", "Rename"),
             ("F3", "View"),
             ("F4/e", "Edit"),

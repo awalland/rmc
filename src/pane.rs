@@ -324,6 +324,16 @@ impl PaneState {
         }
     }
 
+    /// Select all items (except "..")
+    pub fn select_all(&mut self) {
+        let start = if self.entries.first().map(|e| e.name == "..").unwrap_or(false) {
+            1
+        } else {
+            0
+        };
+        self.selected = (start..self.entries.len()).collect();
+    }
+
     pub fn selected_entries(&self) -> Vec<&Entry> {
         if self.selected.is_empty() {
             // If nothing explicitly selected, return cursor item

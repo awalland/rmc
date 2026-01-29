@@ -140,6 +140,9 @@ impl App {
             KeyCode::Insert => {
                 self.active_pane_mut().toggle_selection();
             }
+            KeyCode::Char('*') => {
+                self.active_pane_mut().select_all();
+            }
             KeyCode::Delete | KeyCode::F(8) => {
                 self.initiate_delete();
             }
