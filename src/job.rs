@@ -3,9 +3,9 @@ use std::{
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc,
     },
     thread,
     time::{Duration, Instant},
@@ -295,8 +295,8 @@ impl JobManager {
             job_type: JobType::Delete,
             description,
             source: parent_dir.clone(),
-            destination: PathBuf::new(), // Not used for delete
-            source_canonical: PathBuf::new(), // Not used for delete
+            destination: PathBuf::new(),           // Not used for delete
+            source_canonical: PathBuf::new(),      // Not used for delete
             destination_canonical: PathBuf::new(), // Not used for delete
             status: JobStatus::Running {
                 started_at: Instant::now(),
@@ -763,9 +763,7 @@ fn copy_file_with_progress(
     let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, dest_file);
     let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
 
-    let file_name = source
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned());
+    let file_name = source.file_name().map(|s| s.to_string_lossy().into_owned());
 
     loop {
         // Check cancel flag
@@ -840,19 +838,32 @@ fn delete_worker(
             return;
         }
 
-        if path.is_file() {
-            total_bytes += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            total_files += 1;
-        } else if path.is_dir() {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+
+        if metadata.file_type().is_dir() {
             for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
                 if cancel_flag.load(Ordering::Relaxed) {
                     return;
                 }
-                if entry.file_type().is_file() {
-                    total_bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    total_files += 1;
+
+                if entry.file_type().is_dir() {
+                    continue;
                 }
+
+                total_bytes += if entry.file_type().is_file() {
+                    entry.metadata().map(|m| m.len()).unwrap_or(0)
+                } else {
+                    std::fs::symlink_metadata(entry.path())
+                        .map(|m| m.len())
+                        .unwrap_or(0)
+                };
+                total_files += 1;
             }
+        } else {
+            total_bytes += metadata.len();
+            total_files += 1;
         }
     }
 
@@ -916,13 +927,13 @@ fn delete_path_with_progress(
         Ok(())
     };
 
-    if path.is_file() {
+    let metadata = std::fs::symlink_metadata(path)?;
+
+    if !metadata.file_type().is_dir() {
         wait_if_paused()?;
 
-        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let file_name = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned());
+        let file_size = metadata.len();
+        let file_name = path.file_name().map(|s| s.to_string_lossy().into_owned());
 
         std::fs::remove_file(path)?;
 
@@ -935,9 +946,9 @@ fn delete_path_with_progress(
             current_file: file_name,
             files_processed: *files_processed,
         });
-    } else if path.is_dir() {
-        // Collect all files first, then delete in reverse order (files before dirs)
-        let mut files_to_delete: Vec<PathBuf> = Vec::new();
+    } else {
+        // Collect all leaf entries first, then delete directories deepest-first.
+        let mut leaf_paths: Vec<PathBuf> = Vec::new();
         let mut dirs_to_delete: Vec<PathBuf> = Vec::new();
 
         for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
@@ -949,15 +960,15 @@ fn delete_path_with_progress(
             }
 
             let entry_path = entry.path().to_path_buf();
-            if entry.file_type().is_file() {
-                files_to_delete.push(entry_path);
-            } else if entry.file_type().is_dir() {
+            if entry.file_type().is_dir() {
                 dirs_to_delete.push(entry_path);
+            } else {
+                leaf_paths.push(entry_path);
             }
         }
 
-        // Delete files first
-        for file_path in files_to_delete {
+        // Delete files, symlinks, and other non-directory entries first.
+        for file_path in leaf_paths {
             if cancel_flag.load(Ordering::Relaxed) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
@@ -967,7 +978,9 @@ fn delete_path_with_progress(
 
             wait_if_paused()?;
 
-            let file_size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+            let file_size = std::fs::symlink_metadata(&file_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
             let file_name = file_path
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned());
@@ -1027,5 +1040,65 @@ fn rename_worker(
                 error: e.to_string(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::{
+        fs,
+        sync::mpsc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("rmc-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn delete_directory_removes_symlinks_without_touching_targets() {
+        let root = unique_temp_dir("delete-symlink");
+        let keep_dir = unique_temp_dir("delete-symlink-target");
+        let nested = root.join("snapshot");
+        let target = keep_dir.join("model.bin");
+        let link = nested.join("model-link.bin");
+
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&keep_dir).unwrap();
+        fs::write(root.join("config.json"), b"{}").unwrap();
+        fs::write(&target, b"weights").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let (progress_tx, _progress_rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let pause_flag = Arc::new(AtomicBool::new(false));
+        let mut processed_bytes = 0;
+        let mut files_processed = 0;
+
+        let result = delete_path_with_progress(
+            &root,
+            &progress_tx,
+            JobId(0),
+            &cancel_flag,
+            &pause_flag,
+            &mut processed_bytes,
+            &mut files_processed,
+        );
+
+        assert!(result.is_ok());
+        assert!(!root.exists());
+        assert!(target.exists());
+
+        let _ = fs::remove_dir_all(&keep_dir);
     }
 }

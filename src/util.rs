@@ -51,13 +51,25 @@ fn format_bytes_impl(bytes: u64, long_suffix: bool) -> String {
     const TB: u64 = GB * 1024;
 
     let (value, suffix) = if bytes >= TB {
-        (bytes as f64 / TB as f64, if long_suffix { "TB" } else { "T" })
+        (
+            bytes as f64 / TB as f64,
+            if long_suffix { "TB" } else { "T" },
+        )
     } else if bytes >= GB {
-        (bytes as f64 / GB as f64, if long_suffix { "GB" } else { "G" })
+        (
+            bytes as f64 / GB as f64,
+            if long_suffix { "GB" } else { "G" },
+        )
     } else if bytes >= MB {
-        (bytes as f64 / MB as f64, if long_suffix { "MB" } else { "M" })
+        (
+            bytes as f64 / MB as f64,
+            if long_suffix { "MB" } else { "M" },
+        )
     } else if bytes >= KB {
-        (bytes as f64 / KB as f64, if long_suffix { "KB" } else { "K" })
+        (
+            bytes as f64 / KB as f64,
+            if long_suffix { "KB" } else { "K" },
+        )
     } else {
         return if long_suffix {
             format!("{}B", bytes)

@@ -306,7 +306,13 @@ impl PaneState {
     pub fn toggle_selection(&mut self) {
         if let Some(idx) = self.list_state.selected() {
             // Don't allow selecting ".."
-            if idx == 0 && self.entries.first().map(|e| e.name == "..").unwrap_or(false) {
+            if idx == 0
+                && self
+                    .entries
+                    .first()
+                    .map(|e| e.name == "..")
+                    .unwrap_or(false)
+            {
                 // Move down without selecting
                 self.move_down();
                 return;
@@ -326,7 +332,12 @@ impl PaneState {
 
     /// Select all items (except "..")
     pub fn select_all(&mut self) {
-        let start = if self.entries.first().map(|e| e.name == "..").unwrap_or(false) {
+        let start = if self
+            .entries
+            .first()
+            .map(|e| e.name == "..")
+            .unwrap_or(false)
+        {
             1
         } else {
             0
@@ -349,6 +360,7 @@ impl PaneState {
     pub fn enter_selected(&mut self) -> Result<(), String> {
         if let Some(entry) = self.selected_entry().cloned() {
             if entry.is_dir {
+                let going_up = entry.name == "..";
                 let old_path = self.path.clone();
                 let old_entries = std::mem::take(&mut self.entries);
                 let old_selection = self.list_state.selected();
@@ -366,7 +378,17 @@ impl PaneState {
                     return Err(format_io_error(&e));
                 }
 
-                self.list_state.select(Some(0));
+                if going_up {
+                    // Select the directory we just came from
+                    let idx = self
+                        .entries
+                        .iter()
+                        .position(|e| e.path == old_path)
+                        .unwrap_or(0);
+                    self.list_state.select(Some(idx));
+                } else {
+                    self.list_state.select(Some(0));
+                }
             }
         }
         Ok(())

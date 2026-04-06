@@ -1,9 +1,9 @@
 use crossterm::event::KeyCode;
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout, Rect},
     style::Style,
     widgets::{Block, Borders, Clear},
-    Frame,
 };
 
 use crate::theme::THEME;
@@ -86,12 +86,20 @@ pub fn render_yes_no_buttons(frame: &mut Frame, area: Rect) {
     .split(area);
 
     let yes_button = Paragraph::new(Span::raw(" [Y]es "))
-        .style(Style::default().fg(THEME.dialog_button_fg).bg(THEME.dialog_button_bg))
+        .style(
+            Style::default()
+                .fg(THEME.dialog_button_fg)
+                .bg(THEME.dialog_button_bg),
+        )
         .alignment(Alignment::Center);
     frame.render_widget(yes_button, button_layout[1]);
 
     let no_button = Paragraph::new(Span::raw(" [N]o "))
-        .style(Style::default().fg(THEME.dialog_button_fg).bg(THEME.dialog_button_bg))
+        .style(
+            Style::default()
+                .fg(THEME.dialog_button_fg)
+                .bg(THEME.dialog_button_bg),
+        )
         .alignment(Alignment::Center);
     frame.render_widget(no_button, button_layout[3]);
 }

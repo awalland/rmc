@@ -5,21 +5,21 @@
 use std::{path::Path, time::Duration};
 
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Sparkline, Wrap},
-    Frame,
 };
 
 use crate::{
+    App, UIMode,
     dialog::{centered_rect, render_dialog_frame, render_yes_no_buttons},
     job::{Job, JobStatus},
     pane::{Entry, Pane, SizeDisplayMode},
     theme::THEME,
     util::{format_bytes, format_size},
     viewer::FileViewer,
-    App, UIMode,
 };
 
 impl App {
@@ -44,11 +44,9 @@ impl App {
         };
 
         // Pane layout
-        let pane_layout = Layout::horizontal([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
-        .split(main_layout[0]);
+        let pane_layout =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(main_layout[0]);
 
         self.left_area = pane_layout[0];
         self.right_area = pane_layout[1];
@@ -261,9 +259,7 @@ impl App {
     }
 
     fn render_help_bar(&self, frame: &mut Frame, area: Rect) {
-        let key_style = Style::default()
-            .fg(THEME.help_key_fg)
-            .bg(THEME.help_key_bg);
+        let key_style = Style::default().fg(THEME.help_key_fg).bg(THEME.help_key_bg);
         let desc_style = Style::default()
             .fg(THEME.help_desc_fg)
             .bg(THEME.help_desc_bg);
@@ -321,9 +317,8 @@ impl App {
         }
 
         // Split into left (job list) and right (throughput chart) panes
-        let h_layout =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(inner);
+        let h_layout = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(inner);
 
         let left_area = h_layout[0];
         let right_area = h_layout[1];
@@ -372,9 +367,8 @@ impl App {
 
         // Footer
         let footer_area = layout[visible_jobs.len()];
-        let footer =
-            Paragraph::new("j/k: navigate | P: pause | K: kill | d: dismiss | Esc: close")
-                .style(Style::default().fg(THEME.dialog_hint));
+        let footer = Paragraph::new("j/k: navigate | P: pause | K: kill | d: dismiss | Esc: close")
+            .style(Style::default().fg(THEME.dialog_hint));
         frame.render_widget(footer, footer_area);
     }
 
@@ -390,8 +384,8 @@ impl App {
         let history = job.throughput.history_slice();
 
         if history.is_empty() {
-            let msg = Paragraph::new("Collecting data...")
-                .style(Style::default().fg(THEME.job_no_jobs));
+            let msg =
+                Paragraph::new("Collecting data...").style(Style::default().fg(THEME.job_no_jobs));
             frame.render_widget(msg, inner);
             return;
         }
@@ -485,7 +479,13 @@ impl App {
         }
     }
 
-    fn render_progress_gauge(&self, frame: &mut Frame, area: Rect, job: &Job, color: ratatui::style::Color) {
+    fn render_progress_gauge(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        job: &Job,
+        color: ratatui::style::Color,
+    ) {
         let ratio = if job.progress.total_bytes > 0 {
             job.progress.processed_bytes as f64 / job.progress.total_bytes as f64
         } else {
@@ -539,7 +539,8 @@ impl App {
                 "  {} ({}/{})",
                 file, job.progress.files_processed, job.progress.total_files
             );
-            let file_para = Paragraph::new(file_info).style(Style::default().fg(THEME.job_file_info));
+            let file_para =
+                Paragraph::new(file_info).style(Style::default().fg(THEME.job_file_info));
             frame.render_widget(file_para, area);
         }
     }
@@ -548,10 +549,7 @@ impl App {
         let area = centered_rect(55, 30, frame.area());
         let inner = render_dialog_frame(frame, area, "File Exists", THEME.dialog_warning_border);
 
-        let file_name = file_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
+        let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
 
         let layout = Layout::vertical([
             Constraint::Length(1), // spacer
@@ -682,8 +680,7 @@ impl App {
             }
         }
 
-        let msg =
-            Paragraph::new(lines.join("\n")).alignment(ratatui::layout::Alignment::Center);
+        let msg = Paragraph::new(lines.join("\n")).alignment(ratatui::layout::Alignment::Center);
         frame.render_widget(msg, content_layout[1]);
 
         // Warning for directories
@@ -795,7 +792,8 @@ impl App {
             "Renaming...".to_owned()
         } else {
             // Show countdown
-            let remaining = crate::util::RENAME_DIALOG_TIMEOUT_SECS.saturating_sub(elapsed.as_secs());
+            let remaining =
+                crate::util::RENAME_DIALOG_TIMEOUT_SECS.saturating_sub(elapsed.as_secs());
             format!("Backgrounding in {}...", remaining)
         };
 
@@ -878,8 +876,8 @@ impl App {
             .alignment(ratatui::layout::Alignment::Center);
         frame.render_widget(warning, layout[1]);
 
-        let confirm = Paragraph::new("Kill all jobs and quit?")
-            .alignment(ratatui::layout::Alignment::Center);
+        let confirm =
+            Paragraph::new("Kill all jobs and quit?").alignment(ratatui::layout::Alignment::Center);
         frame.render_widget(confirm, layout[2]);
 
         // Buttons
@@ -915,12 +913,7 @@ impl App {
         } else {
             format_bytes(viewer.original_size)
         };
-        let title = format!(
-            " {} - {} ({}) ",
-            file_name,
-            viewer.mode.label(),
-            size_info
-        );
+        let title = format!(" {} - {} ({}) ", file_name, viewer.mode.label(), size_info);
         let title_style = if viewer.truncated {
             Style::default()
                 .fg(THEME.cursor_active_fg)
@@ -969,9 +962,7 @@ impl App {
                     .fg(THEME.cursor_active_fg)
                     .bg(THEME.cursor_active_bg)
             } else {
-                Style::default()
-                    .fg(THEME.help_key_fg)
-                    .bg(THEME.help_key_bg)
+                Style::default().fg(THEME.help_key_fg).bg(THEME.help_key_bg)
             };
             mode_spans.push(Span::styled(
                 format!(" {}:{} ", mode.shortcut(), mode.label()),

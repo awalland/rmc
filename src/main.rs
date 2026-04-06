@@ -14,10 +14,10 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     ExecutableCommand,
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
 };
-use ratatui::{layout::Rect, DefaultTerminal};
+use ratatui::{DefaultTerminal, layout::Rect};
 
 use job::{JobId, JobManager, JobType};
 use pane::{Entry, Pane, PaneState};
@@ -43,15 +43,25 @@ fn main() -> color_eyre::Result<()> {
 #[derive(Clone)]
 pub enum UIMode {
     Normal,
-    JobList { selected: usize },
-    ConfirmOverwrite { job_id: JobId, file_path: PathBuf },
+    JobList {
+        selected: usize,
+    },
+    ConfirmOverwrite {
+        job_id: JobId,
+        file_path: PathBuf,
+    },
     ConfirmDelete {
         entries: Vec<Entry>,
         /// Cached result of conflict check (computed once when dialog opens)
         has_job_conflict: bool,
     },
-    MkdirInput { input: String },
-    RenameInput { original: PathBuf, input: String },
+    MkdirInput {
+        input: String,
+    },
+    RenameInput {
+        original: PathBuf,
+        input: String,
+    },
     /// Rename is in progress - show countdown if it takes too long
     RenameInProgress {
         job_id: JobId,
@@ -59,12 +69,18 @@ pub enum UIMode {
         original_name: String,
         new_name: String,
     },
-    CommandLine { input: String },
+    CommandLine {
+        input: String,
+    },
     ConfirmQuit,
-    Search { query: String },
+    Search {
+        query: String,
+    },
     /// File viewer - boxed because it contains potentially large file data.
     /// Handlers use mem::take to avoid cloning this variant.
-    FileViewer { viewer: Box<FileViewer> },
+    FileViewer {
+        viewer: Box<FileViewer>,
+    },
 }
 
 impl Default for UIMode {
@@ -320,7 +336,8 @@ impl App {
 
         // Start a job for each selected item
         for source in entries_to_transfer {
-            self.job_manager.start_job(job_type, source, dest_dir.clone());
+            self.job_manager
+                .start_job(job_type, source, dest_dir.clone());
         }
     }
 }

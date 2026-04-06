@@ -15,17 +15,17 @@ pub enum ViewMode {
     Text,
     Hex,
     // Binary analysis tools
-    Disasm,      // objdump -d
-    Strings,     // strings
-    ElfHeader,   // readelf -h
-    Sections,    // readelf -S
-    Symbols,     // readelf --syms
-    Ldd,         // ldd
+    Disasm,    // objdump -d
+    Strings,   // strings
+    ElfHeader, // readelf -h
+    Sections,  // readelf -S
+    Symbols,   // readelf --syms
+    Ldd,       // ldd
     // General tools
-    FileInfo,    // file
-    Exif,        // exiftool
-    Archive,     // tar -tvf / unzip -l
-    Json,        // jq .
+    FileInfo, // file
+    Exif,     // exiftool
+    Archive,  // tar -tvf / unzip -l
+    Json,     // jq .
 }
 
 impl ViewMode {
@@ -80,11 +80,7 @@ impl FileType {
     /// Get available view modes for this file type
     pub fn available_modes(&self) -> Vec<ViewMode> {
         match self {
-            FileType::Text => vec![
-                ViewMode::Text,
-                ViewMode::Hex,
-                ViewMode::FileInfo,
-            ],
+            FileType::Text => vec![ViewMode::Text, ViewMode::Hex, ViewMode::FileInfo],
             FileType::Json => vec![
                 ViewMode::Json,
                 ViewMode::Text,
@@ -101,21 +97,11 @@ impl FileType {
                 ViewMode::Ldd,
                 ViewMode::FileInfo,
             ],
-            FileType::Archive => vec![
-                ViewMode::Archive,
-                ViewMode::Hex,
-                ViewMode::FileInfo,
-            ],
-            FileType::Image => vec![
-                ViewMode::Hex,
-                ViewMode::Exif,
-                ViewMode::FileInfo,
-            ],
-            FileType::Binary | FileType::Unknown => vec![
-                ViewMode::Hex,
-                ViewMode::Strings,
-                ViewMode::FileInfo,
-            ],
+            FileType::Archive => vec![ViewMode::Archive, ViewMode::Hex, ViewMode::FileInfo],
+            FileType::Image => vec![ViewMode::Hex, ViewMode::Exif, ViewMode::FileInfo],
+            FileType::Binary | FileType::Unknown => {
+                vec![ViewMode::Hex, ViewMode::Strings, ViewMode::FileInfo]
+            }
         }
     }
 }
@@ -305,8 +291,8 @@ impl FileViewer {
         let text = String::from_utf8_lossy(&self.raw_bytes);
         match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(value) => {
-                let pretty = serde_json::to_string_pretty(&value)
-                    .unwrap_or_else(|_| text.to_string());
+                let pretty =
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.to_string());
                 Ok(pretty.lines().map(|s| s.to_owned()).collect())
             }
             Err(e) => {
@@ -353,9 +339,9 @@ impl FileViewer {
     /// Uses spawn + try_wait with a timeout to avoid blocking forever
     /// when network filesystems cause system-wide slowdowns.
     fn run_tool(&self, tool: &str, args: &[&str]) -> Result<Vec<String>, String> {
+        use std::io::Read;
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
-        use std::io::Read;
         use std::time::{Duration, Instant};
 
         let mut cmd = Command::new(tool);
@@ -371,7 +357,10 @@ impl FileViewer {
             Ok(c) => c,
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    return Err(format!("'{}' not found - install it to use this feature", tool));
+                    return Err(format!(
+                        "'{}' not found - install it to use this feature",
+                        tool
+                    ));
                 } else {
                     return Err(format!("Failed to run {}: {}", tool, e));
                 }
@@ -512,36 +501,29 @@ fn detect_file_type(path: &Path, bytes: &[u8]) -> FileType {
     }
 
     // Check extension
-    let ext = path.extension()
+    let ext = path
+        .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
 
     match ext.as_str() {
         // Archives
-        "tar" | "gz" | "tgz" | "bz2" | "xz" | "zip" | "jar" | "7z" | "rar" => {
-            FileType::Archive
-        }
+        "tar" | "gz" | "tgz" | "bz2" | "xz" | "zip" | "jar" | "7z" | "rar" => FileType::Archive,
         // Images
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "tiff" | "ico" | "svg" => {
-            FileType::Image
-        }
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "tiff" | "ico" | "svg" => FileType::Image,
         // JSON
         "json" => FileType::Json,
         // Likely text
-        "txt" | "md" | "rst" | "log" | "cfg" | "conf" | "ini" | "yaml" | "yml"
-        | "toml" | "xml" | "html" | "htm" | "css" | "js" | "ts" | "jsx" | "tsx"
-        | "py" | "rs" | "go" | "c" | "h" | "cpp" | "hpp" | "java" | "kt" | "scala"
-        | "rb" | "php" | "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd"
-        | "sql" | "vim" | "lua" | "pl" | "pm" | "r" | "R" | "jl" | "swift"
-        | "m" | "mm" | "hs" | "ml" | "mli" | "ex" | "exs" | "erl" | "hrl"
-        | "clj" | "cljs" | "cljc" | "lisp" | "el" | "scm" | "rkt"
-        | "asm" | "s" | "S" | "nasm" | "Makefile" | "makefile" | "cmake"
-        | "dockerfile" | "Dockerfile" | "gitignore" | "gitattributes"
-        | "editorconfig" | "prettierrc" | "eslintrc" | "babelrc"
-        | "csv" | "tsv" => {
-            FileType::Text
-        }
+        "txt" | "md" | "rst" | "log" | "cfg" | "conf" | "ini" | "yaml" | "yml" | "toml" | "xml"
+        | "html" | "htm" | "css" | "js" | "ts" | "jsx" | "tsx" | "py" | "rs" | "go" | "c" | "h"
+        | "cpp" | "hpp" | "java" | "kt" | "scala" | "rb" | "php" | "sh" | "bash" | "zsh"
+        | "fish" | "ps1" | "bat" | "cmd" | "sql" | "vim" | "lua" | "pl" | "pm" | "r" | "R"
+        | "jl" | "swift" | "m" | "mm" | "hs" | "ml" | "mli" | "ex" | "exs" | "erl" | "hrl"
+        | "clj" | "cljs" | "cljc" | "lisp" | "el" | "scm" | "rkt" | "asm" | "s" | "S" | "nasm"
+        | "Makefile" | "makefile" | "cmake" | "dockerfile" | "Dockerfile" | "gitignore"
+        | "gitattributes" | "editorconfig" | "prettierrc" | "eslintrc" | "babelrc" | "csv"
+        | "tsv" => FileType::Text,
         _ => {
             // Check content for binary vs text
             if is_likely_text(bytes) {
@@ -560,7 +542,11 @@ fn is_likely_text(bytes: &[u8]) -> bool {
     }
 
     // Sample first 8KB
-    let sample = if bytes.len() > 8192 { &bytes[..8192] } else { bytes };
+    let sample = if bytes.len() > 8192 {
+        &bytes[..8192]
+    } else {
+        bytes
+    };
 
     let mut non_text_count = 0;
     for &b in sample {

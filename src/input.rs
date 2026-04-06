@@ -9,19 +9,19 @@ use std::{
 };
 
 use crossterm::{
+    ExecutableCommand,
     event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
-    ExecutableCommand,
 };
 use ratatui::DefaultTerminal;
 
 use crate::{
-    dialog::{handle_yes_no_keys, DialogResult},
+    App, UIMode,
+    dialog::{DialogResult, handle_yes_no_keys},
     job::{ConflictResolution, JobId, JobStatus, JobType},
     pane::{Entry, Pane},
     util::{PAGE_SCROLL_SIZE, RENAME_DIALOG_TIMEOUT_SECS},
     viewer::{FileViewer, ViewMode},
-    App, UIMode,
 };
 
 impl App {
@@ -343,9 +343,7 @@ impl App {
                     .job_manager
                     .all_jobs()
                     .iter()
-                    .filter(|j| {
-                        matches!(j.status, JobStatus::Running { .. } | JobStatus::Visible)
-                    })
+                    .filter(|j| matches!(j.status, JobStatus::Running { .. } | JobStatus::Visible))
                     .map(|j| j.id)
                     .collect();
 
@@ -496,9 +494,11 @@ impl App {
                         let parent_dir = self.active_pane().path.clone();
 
                         // Start async rename job
-                        let job_id =
-                            self.job_manager
-                                .start_rename_job(original.clone(), new_path, parent_dir);
+                        let job_id = self.job_manager.start_rename_job(
+                            original.clone(),
+                            new_path,
+                            parent_dir,
+                        );
 
                         let original_name = original
                             .file_name()
@@ -627,11 +627,7 @@ impl App {
 
         let matches: Vec<String> = entries
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with(&match_prefix)
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&match_prefix))
             .map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
                 // Add trailing slash for directories
@@ -749,10 +745,8 @@ impl App {
                     self.previous_path = Some(old_path);
                 }
             } else {
-                self.error_message = Some((
-                    format!("cd: not a directory: {}", path_str),
-                    Instant::now(),
-                ));
+                self.error_message =
+                    Some((format!("cd: not a directory: {}", path_str), Instant::now()));
             }
 
             return Ok(());
@@ -855,7 +849,9 @@ impl App {
         let _ = stdout.execute(LeaveAlternateScreen);
 
         // Run the editor
-        let status = std::process::Command::new(&editor).arg(&entry.path).status();
+        let status = std::process::Command::new(&editor)
+            .arg(&entry.path)
+            .status();
 
         // Re-enter alternate screen and enable raw mode
         let _ = stdout.execute(EnterAlternateScreen);
@@ -935,9 +931,7 @@ impl App {
 
     pub fn check_rename_progress(&mut self) {
         if let UIMode::RenameInProgress {
-            job_id,
-            started_at,
-            ..
+            job_id, started_at, ..
         } = &self.ui_mode
         {
             let job_id = *job_id;
