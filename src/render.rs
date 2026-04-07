@@ -5,21 +5,21 @@
 use std::{path::Path, time::Duration};
 
 use ratatui::{
-    Frame,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Sparkline, Wrap},
+    Frame,
 };
 
 use crate::{
-    App, UIMode,
     dialog::{centered_rect, render_dialog_frame, render_yes_no_buttons},
     job::{Job, JobStatus},
     pane::{Entry, Pane, SizeDisplayMode},
     theme::THEME,
     util::{format_bytes, format_size},
     viewer::FileViewer,
+    App, UIMode,
 };
 
 impl App {
@@ -270,9 +270,9 @@ impl App {
             ("*", "All"),
             ("F2", "Rename"),
             ("F3", "View"),
-            ("F4/e", "Edit"),
-            ("F5/c", "Copy"),
-            ("F6/m", "Move"),
+            ("F4", "Edit"),
+            ("F5", "Copy"),
+            ("F6", "Move"),
             ("F7", "Mkdir"),
             ("F8/Del", "Delete"),
             ("H", "Hidden"),

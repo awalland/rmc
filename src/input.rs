@@ -9,19 +9,19 @@ use std::{
 };
 
 use crossterm::{
-    ExecutableCommand,
     event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
+    ExecutableCommand,
 };
 use ratatui::DefaultTerminal;
 
 use crate::{
-    App, UIMode,
-    dialog::{DialogResult, handle_yes_no_keys},
+    dialog::{handle_yes_no_keys, DialogResult},
     job::{ConflictResolution, JobId, JobStatus, JobType},
     pane::{Entry, Pane},
     util::{PAGE_SCROLL_SIZE, RENAME_DIALOG_TIMEOUT_SECS},
     viewer::{FileViewer, ViewMode},
+    App, UIMode,
 };
 
 impl App {
@@ -128,10 +128,10 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => {
                 self.navigate_to_parent();
             }
-            KeyCode::Char('c') | KeyCode::F(5) => {
+            KeyCode::F(5) => {
                 self.transfer_selected_to_other_pane(JobType::Copy);
             }
-            KeyCode::Char('m') | KeyCode::F(6) => {
+            KeyCode::F(6) => {
                 self.transfer_selected_to_other_pane(JobType::Move);
             }
             KeyCode::Char('J') => {
@@ -149,7 +149,7 @@ impl App {
             KeyCode::F(3) => {
                 self.view_selected();
             }
-            KeyCode::Char('e') | KeyCode::F(4) => {
+            KeyCode::F(4) => {
                 if let Err(msg) = self.edit_selected(terminal) {
                     self.error_message = Some((msg, Instant::now()));
                 }
