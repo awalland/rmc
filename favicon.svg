@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <title>rmc — Rust Midnight Commander</title>
+  <rect width="32" height="32" rx="6" fill="#101b36"/>
+  <g fill="#172b50" stroke="#6bd5ed" stroke-width="2">
+    <rect x="4" y="6" width="10" height="20" rx="1"/>
+    <rect x="18" y="6" width="10" height="20" rx="1"/>
+  </g>
+  <path d="M5 12h8M19 12h8" stroke="#6bd5ed" stroke-width="2"/>
+  <path d="M7 16h4M7 20h3M21 20h4" stroke="#9cb5d5" stroke-width="2"/>
+  <path d="M19 16h8" stroke="#ffbf69" stroke-width="3"/>
+</svg>
